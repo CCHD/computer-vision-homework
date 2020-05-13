@@ -1,0 +1,323 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+import torch
+from torchvision import transforms, datasets
+import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+import torch.nn.functional as F
+from PIL import Image
+from torch.utils.tensorboard import SummaryWriter
+
+def conv3x3(inplanes, planes, stride=1):
+    return nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+# In[2]:
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+class Bottleneck(nn.Module):
+    expansion = 4
+ 
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+ 
+    def forward(self, x):
+        residual = x
+ 
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+ 
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+ 
+        out = self.conv3(out)
+        out = self.bn3(out)
+ 
+        if self.downsample is not None:
+            residual = self.downsample(x)
+ 
+        out += residual
+        out = self.relu(out)
+ 
+        return out
+
+
+# In[29]:
+
+
+class ResNet(nn.Module):
+ 
+    def __init__(self, block, layers, num_classes=10):
+        self.inplanes = 64
+        super(ResNet, self).__init__()
+        # 原本kernel_size=7,stride=2,padding=3，为了适应cifar-10的32*32,(7,2,3) ->（3, 1, 1）
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        # (3,2,1)->(3,1,1)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        # self.avgpool = nn.AvgPool2d(7, stride=1)
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+ 
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+ 
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+ 
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+ 
+        return nn.Sequential(*layers)
+ 
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+ 
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+ 
+        x = F.avg_pool2d(x, 4)
+        # x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+ 
+        return x
+
+
+# In[30]:
+
+
+def ResNet50():
+    return ResNet(Bottleneck, [3, 4, 6, 3])
+
+def ResNet18():
+    return ResNet(BasicBlock, [2, 2, 2, 2])
+# In[31]:
+
+
+batch_size=256
+epoch=200
+device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# In[32]:
+
+
+train_transform = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(0.5),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
+
+test_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
+
+
+train_set = datasets.CIFAR10(root='./data', train=True, download=True, transform=train_transform)
+test_set = datasets.CIFAR10(root='./data', train=False, download=True, transform=test_transform)
+
+train_loader = torch.utils.data.DataLoader(train_set, batch_size=batch_size, shuffle=True)
+test_loader = torch.utils.data.DataLoader(test_set, batch_size=batch_size, shuffle=False)
+
+classes = ('plane', 'car', 'bird', 'cat',
+           'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+
+# In[34]:
+
+
+model = ResNet18().to(device)
+print(model)
+save_model_path = './ResNet18_model_2.pth'
+criterion = nn.CrossEntropyLoss(reduction='sum')
+optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4)
+scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[40, 90, 150], gamma=0.2)
+
+# In[35]:
+
+
+# 训练过程
+def train(model, device, train_loader, optimizer, scheduler, criterion, num_epoch):
+    model.train()
+    count = 0
+    best_valid_accuray = 0.
+    best_epoch_id = 0
+    for epoch in range(1, num_epoch+1):
+        running_loss = 0.
+        for batch_idx, (data, target) in enumerate(train_loader):
+            count += 1
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            if (batch_idx+1)%30 == 0:
+                print("Train Epoch: {} [{}/{} ({:.2f}%)]\tLoss: {:.6f}".format(
+                epoch, batch_idx*len(data), len(train_loader.dataset), 100.*batch_idx/len(train_loader), loss.item()))
+                with open('./resnet_train_log.txt', 'a+') as f:
+                    f.write("Train Epoch: {} [{}/{} ({:.2f}%)]\tLoss: {:.6f}\n".format(
+                epoch, batch_idx*len(data), len(train_loader.dataset), 100.*batch_idx/len(train_loader), loss.item()))
+        
+        scheduler.step()
+        
+        with SummaryWriter('./resnet_scalar') as writer:#自动调用close()
+            writer.add_scalar('restnet_scalar/train_loss', running_loss/len(train_loader.dataset), epoch)
+            writer.add_scalar('resnet_scalar/train_accuracy', eval(model, device, train_loader)[0], epoch)
+            test_accuracy, test_loss = eval(model, device, test_loader, is_train=False)
+            if test_accuracy>best_valid_accuray:
+                best_valid_accuray = test_accuracy
+                best_epoch_id = epoch
+            writer.add_scalar('resnet_scalar/test_accuracy', test_accuracy, epoch)
+            writer.add_scalar('resnet_scalar/test_loss', test_loss, epoch)
+
+        if early_stop(best_epoch_id, epoch):
+            print("\nEarly Stop at Epoch {}, Accuracy: {}\n".format(best_epoch_id, best_valid_accuray))
+            with open('./resnet_train_log.txt', 'a+') as f:
+                f.write("\nEarly Stop at Epoch {}, Accuracy: {}\n".format(best_epoch_id, best_valid_accuray))
+            break
+        elif best_epoch_id == epoch:
+            print("\nSave Model at Epoch {}, Accuracy: {}\n".format(best_epoch_id, best_valid_accuray))
+            with open('./resnet_train_log.txt', 'a+') as f:
+                f.write("\nSave Model at Epoch {}, Accuracy: {}\n".format(best_epoch_id, best_valid_accuray))
+            torch.save(model, save_model_path)
+        else:
+            continue
+    print("\nBest Accuracy: {} at Epoch {}\n".format(best_valid_accuray, best_epoch_id))
+    with open('./resnet_train_log.txt', 'a+') as f:
+        f.write("\nBest Accuracy: {} at Epoch {}\n".format(best_valid_accuray, best_epoch_id))
+# In[36]:
+
+def early_stop(best_epoch_id, epoch, patience=10):
+    if epoch - best_epoch_id > patience:
+        return True
+    return False
+
+# 评估函数
+def eval(model, device, test_loader, is_train=True):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            test_loss += criterion(output, target).item()
+            # 获得最大概率下标
+            pred = output.max(1, keepdim=True)[1]
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    
+    test_loss /= len(test_loader.dataset)
+    if is_train:
+        print('\nTrain Average Loss: {:.4f}, Accuracy: {}/{} ({:.2f})%\n'.format(
+            test_loss, correct, len(test_loader.dataset), 100.*correct/len(test_loader.dataset)))
+        with open('./resnet_train_log.txt', 'a+') as f:
+            f.write('\nTrain Average Loss: {:.4f}, Accuracy: {}/{} ({:.2f})%\n'.format(
+            test_loss, correct, len(test_loader.dataset), 100.*correct/len(test_loader.dataset)))
+    else:
+        print('\nValid Average Loss: {:.4f}, Accuracy: {}/{} ({:.2f})%\n'.format(
+            test_loss, correct, len(test_loader.dataset), 100.*correct/len(test_loader.dataset)))
+        with open('./resnet_train_log.txt', 'a+') as f:
+            f.write('\nValid Average Loss: {:.4f}, Accuracy: {}/{} ({:.2f})%\n'.format(
+            test_loss, correct, len(test_loader.dataset), 100.*correct/len(test_loader.dataset)))
+    return 100.*correct/len(test_loader.dataset), test_loss
+
+
+# In[ ]:
+
+
+train(model, device, train_loader, optimizer, scheduler, criterion, epoch)
+
+
+classes = ('plane','car','bird','cat','deer','dog','forg','horse','ship','truck')
+def predict(model_path, img_path):
+    model = torch.load(model_path)
+    transform=transforms.Compose([
+                                transforms.Resize((32,32)),
+                                transforms.ToTensor(),
+                                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+                             ])
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    model.eval()
+    img = Image.open(img_path)
+    img = transform(img).to(device)
+    img = img.unsqueeze(0)
+    output = model(img)
+    prob = F.softmax(output, dim=1)
+    pred = prob.max(dim=1)[1].item()
+    return classes[pred]
+# In[ ]:
+
+
+
